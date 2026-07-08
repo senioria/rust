@@ -238,6 +238,50 @@ impl<'f, 'tcx> Coerce<'f, 'tcx> {
         })
     }
 
+    // Examine the target type and consider type-specific coercions, such as
+    // auto-borrowing, coercing pointer mutability, pin-ergonomics,
+    // or generic reborrow.
+    fn try_coerce_target(&self, a: Ty<'tcx>, b: Ty<'tcx>) -> Option<CoerceResult<'tcx>> {
+        Some(match *b.kind() {
+            ty::RawPtr(_, b_mutbl) => self.coerce_to_raw_ptr(a, b, b_mutbl),
+            ty::Ref(r_b, _, mutbl_b) => {
+                if let Some(pin_ref_to_ref) = self.maybe_pin_ref_to_ref(a, b) {
+                    self.coerce_pin_ref_to_ref(pin_ref_to_ref)
+                } else {
+                    self.coerce_to_ref(a, b, r_b, mutbl_b)
+                }
+            }
+            _ if let Some(to_pin_ref) = self.maybe_to_pin_ref(a, b) => {
+                self.coerce_to_pin_ref(to_pin_ref)
+            }
+            ty::Adt(_, _)
+                if self.tcx.features().reborrow()
+                    && self
+                        .fcx
+                        .infcx
+                        .type_implements_trait(
+                            self.tcx
+                                .lang_items()
+                                .reborrow()
+                                .expect("Unexpectedly using core/std without reborrow"),
+                            [b],
+                            self.fcx.param_env,
+                        )
+                        .must_apply_modulo_regions() =>
+            {
+                let reborrow_coerce = self.commit_if_ok(|_| self.coerce_reborrow(a, b));
+                if reborrow_coerce.is_ok() {
+                    reborrow_coerce
+                } else {
+                    return None;
+                }
+            }
+            _ => {
+                return None;
+            }
+        })
+    }
+
     #[instrument(skip(self), ret)]
     fn coerce(&self, a: Ty<'tcx>, b: Ty<'tcx>) -> CoerceResult<'tcx> {
         // First, remove any resolved type variables (at the top level, at least):
@@ -282,43 +326,9 @@ impl<'f, 'tcx> Coerce<'f, 'tcx> {
             }
         }
 
-        // Examine the target type and consider type-specific coercions, such
-        // as auto-borrowing, coercing pointer mutability, pin-ergonomics, or
-        // generic reborrow.
-        match *b.kind() {
-            ty::RawPtr(_, b_mutbl) => {
-                return self.coerce_to_raw_ptr(a, b, b_mutbl);
-            }
-            ty::Ref(r_b, _, mutbl_b) => {
-                if let Some(pin_ref_to_ref) = self.maybe_pin_ref_to_ref(a, b) {
-                    return self.coerce_pin_ref_to_ref(pin_ref_to_ref);
-                }
-                return self.coerce_to_ref(a, b, r_b, mutbl_b);
-            }
-            _ if let Some(to_pin_ref) = self.maybe_to_pin_ref(a, b) => {
-                return self.coerce_to_pin_ref(to_pin_ref);
-            }
-            ty::Adt(_, _)
-                if self.tcx.features().reborrow()
-                    && self
-                        .fcx
-                        .infcx
-                        .type_implements_trait(
-                            self.tcx
-                                .lang_items()
-                                .reborrow()
-                                .expect("Unexpectedly using core/std without reborrow"),
-                            [b],
-                            self.fcx.param_env,
-                        )
-                        .must_apply_modulo_regions() =>
-            {
-                let reborrow_coerce = self.commit_if_ok(|_| self.coerce_reborrow(a, b));
-                if reborrow_coerce.is_ok() {
-                    return reborrow_coerce;
-                }
-            }
-            _ => {}
+        // Consider target-specified coercion first
+        if let Some(target) = self.try_coerce_target(a, b) {
+            return target;
         }
 
         match *a.kind() {
@@ -350,8 +360,19 @@ impl<'f, 'tcx> Coerce<'f, 'tcx> {
                 }
             }
             _ => {
-                // Otherwise, just use unification rules.
-                self.unify(a, b, ForceLeakCheck::No)
+                // Otherwise, use unification rules, but try target-specified coercions again:
+                // it should be no-op most of the time since it's just coercing to itself,
+                // but necessary to get the adjustments like reborrow.
+                let InferOk { value: unified, mut obligations } =
+                    self.unify_raw(a, b, ForceLeakCheck::No)?;
+                let unified = self.shallow_resolve(unified);
+                if let Some(coerced) = self.try_coerce_target(a, unified) {
+                    let InferOk { value: (adjustments, ty), obligations: o } = coerced?;
+                    obligations.extend(o);
+                    success(adjustments, ty, obligations)
+                } else {
+                    success(vec![], unified, obligations)
+                }
             }
         }
     }
